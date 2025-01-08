@@ -22,6 +22,7 @@ class CityListViewModel: ObservableObject {
     
     @Published var cities: [City] = []
     @Published var filteredCities: [City] = []
+    var cityIndexMap: [UUID: Int] = [:]
     
     @Published var inputText: String = ""
     @Published var isFavoriteFilterActive = false
@@ -34,7 +35,7 @@ class CityListViewModel: ObservableObject {
     }
     
     func viewDidAppear() async {
-        let favoriteCities = await getFavoriteCity()
+        let favoriteCities = await getFavoriteCities()
         await fetchCities(withFavorites: favoriteCities)
     }
     
@@ -44,15 +45,9 @@ class CityListViewModel: ObservableObject {
         } else {
             deleteCity(city: city)
         }
-        
-        Task.detached {
-            await MainActor.run {
-                var updatedCities = self.cities
-                if let index = updatedCities.firstIndex(where: { $0.id == city.id }) {
-                    updatedCities[index].isFavorite = city.isFavorite
-                }
-                self.cities = updatedCities
-            }
+        if let index = self.cityIndexMap[city.id] {
+            self.cities[index].isFavorite = city.isFavorite
+            filterCities()
         }
     }
     
@@ -61,15 +56,15 @@ class CityListViewModel: ObservableObject {
             await MainActor.run {
                 self.loading = true
             }
-
             do {
                 let cityListAPIModel: [CityListAPIModel] = try await self.cityListModel.fetchCities()
-                
                 let orderedCities = await self.orderCities(
                     cities: self.mapCityListAPIModel(cities: cityListAPIModel, withFavorites: withFavorites)
                 )
-                
                 await MainActor.run {
+                    self.cityIndexMap = orderedCities.enumerated().reduce(into: [:]) { result, pair in
+                        result[pair.element.id] = pair.offset
+                    }
                     self.cities = orderedCities
                     self.filteredCities = orderedCities
                     if !orderedCities.isEmpty {
@@ -87,29 +82,10 @@ class CityListViewModel: ObservableObject {
     }
     
     func filterCities() {
-        Task.detached { [weak self] in
-            guard let self = self else { return }
-            
-            let (bgCities, bgInputText, bgIsFavoriteFilterActive): ([City], String, Bool) = await MainActor.run {
-                (self.cities, self.inputText, self.isFavoriteFilterActive)
-            }
-
-            let filteredResults: [City] = {
-                var results = bgInputText.isEmpty ? bgCities : bgCities.filter {
-                    $0.name.range(of: bgInputText, options: [.caseInsensitive, .anchored]) != nil
-                }
-
-                if bgIsFavoriteFilterActive {
-                    results = results.filter { $0.isFavorite }
-                }
-
-                return results
-            }()
-
-            await MainActor.run {
-                self.filteredCities = filteredResults
-                self.selectedCity = filteredResults.first
-            }
+        let lowercasedPrefix = inputText.lowercased()
+        filteredCities = cities.filter { city in
+            city.name.lowercased().hasPrefix(lowercasedPrefix) &&
+            (isFavoriteFilterActive == true ? city.isFavorite == true : true)
         }
     }
     
@@ -132,12 +108,15 @@ class CityListViewModel: ObservableObject {
 
 extension CityListViewModel {
     
-    func getFavoriteCity() async -> [City] {
+    func getFavoriteCities() async -> [City] {
         if let localStorage = self.localStorage {
             do {
                 let descriptor = FetchDescriptor<CityLocalModel>()
                 var localCities: [CityLocalModel]
                 localCities = try localStorage.fetch(descriptor)
+                for city in localCities {
+                    print("ID: \(city.id), NAME: \(city.name)")
+                }
                 return self.mapLocalCityListToViewModel(cities: localCities)
             } catch {
                 print("Unable to fetch favorites from Local Storage.")
@@ -147,25 +126,6 @@ extension CityListViewModel {
             print("Local Storage not available.")
             return []
         }
-    }
-    
-    func getFavoriteCities() -> [City] {
-        var favoriteCities: [City] = []
-        DispatchQueue.main.async {
-            if let localStorage = self.localStorage {
-                do {
-                    let descriptor = FetchDescriptor<CityLocalModel>()
-                    var localCities: [CityLocalModel]
-                    localCities = try localStorage.fetch(descriptor)
-                    favoriteCities = self.mapLocalCityListToViewModel(cities: localCities)
-                } catch {
-                    print("Unable to fetch favorites from Local Storage.")
-                }
-            } else {
-                print("Local Storage not available.")
-            }
-        }
-        return favoriteCities
     }
     
     func saveCity(city: City) {
@@ -185,12 +145,14 @@ extension CityListViewModel {
         DispatchQueue.main.async {
             if let localStorage = self.localStorage {
                 do {
-                    let localModel = self.mapCityToLocalModel(city: city)
-                    print("Attempting to delete local model: \(localModel)")
-                    
-                    localStorage.delete(localModel)
+                    let descriptor = FetchDescriptor<CityLocalModel>(predicate: #Predicate<CityLocalModel> { $0.name == city.name })
+                    let results = try localStorage.fetch(descriptor)
+                    guard let cityToDelete = results.first else {
+                        print("No city found with the name \(city.name).")
+                        return
+                    }
+                    localStorage.delete(cityToDelete)
                     print("City deleted successfully.")
-                    
                     try localStorage.save()
                     print("Changes saved successfully.")
                 } catch {
@@ -202,15 +164,11 @@ extension CityListViewModel {
         }
     }
 
-    
 }
 
 extension CityListViewModel {
     
     func mapCityListAPIModel(cities: [CityListAPIModel], withFavorites: [City]) -> [City] {
-        for fav in withFavorites {
-            print(fav.name)
-        }
         var cityList: [City] = []
         for city in cities {
             let cityId = UUID(uuidString: String(city.id)) ?? UUID()
