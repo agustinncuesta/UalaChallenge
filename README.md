@@ -1,4 +1,4 @@
-# Uala Challenge
+# Ualá Challenge
 ## Author: Agustín Cuesta
 Created on: January 8, 2025
 
